@@ -1,0 +1,175 @@
+---
+title: "Machine Learning: Weight Training Common Mistakes"
+author: "Brian Flynn"
+date: "August 13, 2017"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(warning = FALSE)
+knitr::opts_chunk$set(message = FALSE)
+```
+
+## Summary
+
+This exercise is to try to learn from data when a person is performing a weightlifting technique incorrectly. We look at data recorded from accelerometers on a 6 participants as they perform a weightlifting task. They performed the excerise both correctly and incorrectly, making specific mistakes when performing incorrectly -  the data is divided into multiple classes, one class for the correct technique, and one class for each specific mistakes they were asked to include during the routine. The task is to determine which class a particular measurement comes from.
+
+## Data Set Processing
+
+### Getting the Data
+
+The original source of the data is: http://web.archive.org/web/20161224072740/http:/groupware.les.inf.puc-rio.br/har, however the training and test data sets are also available at:
+
+ * Training: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.cs
+ * Test: https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv
+
+```{r loadData}
+
+if(!file.exists("train.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", "train.csv")
+}
+if(!file.exists("test.csv")) {
+  download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", "test.csv")
+}
+
+trainData <- read.csv("train.csv")
+testData <- read.csv("test.csv")
+```
+
+### Feature Selection
+
+We are not interested in some of the columns in our dataset, particularly columns like X (the row number), timestamps, window markers, and columns with mostly NA values. We are also not interested in the user, as we would like our prediction to extend to the general case as opposed to matching for a specific user. We are mainly interested in the measurements from the accelerometers/gyroscopes etc. We have chose the columns with pitch, roll or yaw ar the start, or, x, y, z at the end. We the create new training and test data sets with only the columns of interest.
+
+```{r featureSelection}
+library(knitr)
+n <- grep("classe|^pitch|^roll|^yaw|\\_x$|\\_y$|\\_z$", names(trainData))
+trainNames <- names(trainData)[n]
+r <-  ceiling(length(n) / 6)
+full_list <- sapply(array(1:(r*6)), FUN = function(x) { ifelse(x <= length(trainNames), trainNames[[x]], "") })
+m <- t(matrix(full_list, 6, r))
+kable(m)
+trainCols <- trainData[,n]
+testCols <- testData[,n]
+```
+
+### Correlation Between Features
+
+We next get the correlation matrix between our features, and try to find highly correlated features to see if we have any unnecessary features. We filter our correlations to only show correlations > 85%.
+
+```{r correlation}
+lastCol <- length(trainCols)
+c <- cor(trainCols[,-lastCol])
+l <- c()
+library(corrplot)
+for (i in 1:(lastCol-1)) {
+  for(j in 1:(lastCol-1)) {
+    if(abs(c[i,j]) > 0.85 & i != j) {
+      l <- append(l, i)
+      l <- append(l, j)
+    }
+  }
+}
+high_corr <- unique(l)
+corrplot(cor(trainCols[,high_corr]))
+
+```
+
+From this we can see that a number of our features are highly correlated. We find 4 groups of highly correlated variables:
+
+* roll_belt, accel_belt_y, accel_belt_z
+* pitch_belt, accel_belt_x, magnet_belt_x
+* gyros_arm_x, gyros_arm_y
+* gyros_dumbbell_x, gyros_dumbbell_z, gyros_dumbbell_z
+
+Although these are correlated, given the data, we expect some correlation between these variables - due to the nature of the exercise when one part of the body other parts of the body also move in a correlated fashion - e.g. when the arm moves in the x direction, it will also move in the y direction. Further, the purpose of this analysis is to classify mistakes in technique, as such small differences in the correlation between these variables may be very important to classifying the examples. So we leave the entire set of features in.
+
+### Training and Cross-Validation Sets
+
+We want to be able to estimate our out of sample error rate, so we split our our original training data set into a training and cross validation set. 
+
+```{r crossValidation}
+library(caret)
+inTrain <- createDataPartition(y=trainCols$classe, p=0.75, list=F)
+training <- trainCols[inTrain,]
+train_x <- training[,-49]
+train_y <- training[,49]
+
+cv <- trainCols[-inTrain,]
+cv_x <- cv[,-49]
+cv_y <- cv[,49]
+
+test_x <- testCols[,-49]
+test_problem <- testCols[,49]
+```
+
+## Fitting the Data
+
+Some of the training methods take a long time, so we want to optimize by running in parallel, so we first create a generic function we can reuse to train in parallel.
+```{r fitting}
+set.seed(91949)
+library(mlbench)
+library(parallel)
+library(doParallel)
+
+trainParallel <- function(x, y, method) {
+  cluster <- makeCluster(detectCores() - 1)
+  registerDoParallel(cluster)
+  
+  fitControl <- trainControl(method = "cv", number = 10, allowParallel = TRUE) 
+  fit <- train(x, y, method=method, trControl= fitControl)
+
+  stopCluster(cluster)
+  registerDoSEQ()
+  
+  fit
+}
+```
+
+### Classification Tree
+
+```{r classification, cache=T}
+rpartFit <- trainParallel(train_x, train_y, "rpart")
+rpartPred <- predict(rpartFit, training)
+rpartCM <- confusionMatrix(rpartPred, training$classe)
+rpartPredCV <- predict(rpartFit, cv)
+rpartCVCM <- confusionMatrix(rpartPredCV, cv$classe)
+```
+The first fit we try is a simple classification tree using rpart. We evaluate its 'In Sample' error rate, and get a result of: `r round(rpartCM$overall["Accuracy"][[1]]*100, 2)`%. We next predict on the cross-validation set to get the out of sample error rate, which `r round(rpartCVCM$overall["Accuracy"][[1]]*100, 2)`%. Overall we can say that although the model does generalize well - the in sample and out of sample accuracy rates are similar - the accuracy is not particularly good.
+
+### Linear Discriminant Analysis
+
+```{r lda, cache=T}
+ldaFit <- trainParallel(train_x, train_y, "lda")
+ldaPred <- predict(ldaFit, train_x)
+ldaCM <- confusionMatrix(ldaPred, train_y)
+ldaPredCV <- predict(ldaFit, cv_x)
+ldaCVCM <- confusionMatrix(ldaPredCV, cv_y)
+```
+The second model we try is the LDA, or Linear Discriminant Analysis model. The accuracy when using this model is `r round(rpartCM$overall["Accuracy"][[1]]*100, 2)`%, which is a significant improvement on the simple classification tree model. When applied to the CV set, we get and accuracy of `r round(rpartCVCM$overall["Accuracy"][[1]]*100, 2)`%, so we can say this result generalizes well, but again the accuracy is not as high as we would like.
+
+
+### Random Forest
+
+```{r randomForest, cache=TRUE}
+rfFit <- trainParallel(train_x, train_y, "rf")
+rfPred <- predict(rfFit, train_x)
+rfCM <- confusionMatrix(rfPred, train_y)
+rfPredCV <- predict(rfFit, cv_x)
+rfCVCM <- confusionMatrix(rfPredCV, cv_y)
+```
+
+The last model we try is a random forest model. The results of this which gives a `r round(rfCM$overall["Accuracy"][[1]]*100, 2)`% on the training set and `r round(rfCVCM$overall["Accuracy"][[1]]*100, 2)`% on the cross-validation set. This suggests an out of sample error rate of `r round((1-rfCVCM$overall["Accuracy"][[1]])*100, 2)`%. The Random forest itself provides an estimate of out of sample error which is `r round(tail(rfFit$finalModel$err.rate[,1], n=1)*100, 2)`% - close to the estimate using our separate CV data set - so we can say this model both gives us an excellent accuracy, and it generalizes well. 
+
+## Classifying the Test Data
+
+We finally run this on the test data and get the following classifications:
+```{r testData}
+testResult <- data.frame(problem=test_problem)
+testResult$prediction <- predict(rfFit, test_x)
+kable(t(testResult))
+```
+
+## Conclusion
+
+We tried three different models, with Random Forest performing the best, with an out of sample error estimate of close to 0. We used this to predict the 20 values in the test set, and expect that, given the out of sample error rate, we will predict all of these correctly.
